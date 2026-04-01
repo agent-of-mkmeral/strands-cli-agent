@@ -5,15 +5,81 @@ but wraps them with:
 1. Task-aware execution via Strands MCPClient TasksConfig
 2. Notification callbacks that feed into the TaskManager
 3. Logging callbacks that display real-time server messages in the CLI
+4. Environment variable pass-through (${VAR_NAME} syntax in config values)
 """
 
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
+
+# Pattern to match ${VAR_NAME} references in config values
+_ENV_VAR_PATTERN = re.compile(r"\$\{([^}]+)\}")
+
+
+def resolve_env_vars(value: str) -> str:
+    """Resolve ${VAR_NAME} references in a string value.
+
+    Replaces all occurrences of ${VAR_NAME} with the corresponding
+    environment variable value. If the variable is not set, leaves
+    the reference as-is and logs a warning.
+
+    Supports:
+    - Full replacement: "${MY_TOKEN}" → "actual_token_value"
+    - Partial replacement: "Bearer ${MY_TOKEN}" → "Bearer actual_token_value"
+    - Multiple references: "${HOST}:${PORT}" → "localhost:8080"
+    - Nested-safe: only matches ${...} (not $VAR or {{VAR}})
+
+    Args:
+        value: String that may contain ${VAR_NAME} references
+
+    Returns:
+        String with env var references resolved
+    """
+    if not isinstance(value, str) or "${" not in value:
+        return value
+
+    def _replace(match: re.Match) -> str:
+        var_name = match.group(1)
+        env_value = os.environ.get(var_name)
+        if env_value is None:
+            logger.warning(f"Environment variable '{var_name}' not set (referenced as ${{{var_name}}})")
+            return match.group(0)  # Leave as-is
+        return env_value
+
+    return _ENV_VAR_PATTERN.sub(_replace, value)
+
+
+def resolve_env_vars_in_dict(d: dict[str, Any]) -> dict[str, Any]:
+    """Recursively resolve ${VAR_NAME} references in dict values.
+
+    Processes string values, lists, and nested dicts. Non-string
+    values (int, bool, None) are left unchanged.
+
+    Args:
+        d: Dictionary with potentially unresolved env var references
+
+    Returns:
+        New dictionary with all string values resolved
+    """
+    resolved = {}
+    for key, value in d.items():
+        if isinstance(value, str):
+            resolved[key] = resolve_env_vars(value)
+        elif isinstance(value, dict):
+            resolved[key] = resolve_env_vars_in_dict(value)
+        elif isinstance(value, list):
+            resolved[key] = [
+                resolve_env_vars(item) if isinstance(item, str) else item
+                for item in value
+            ]
+        else:
+            resolved[key] = value
+    return resolved
 
 
 def load_mcp_config(config_path: str | None = None) -> dict[str, Any]:
@@ -72,6 +138,17 @@ def create_mcp_clients(
 ) -> list[Any]:
     """Create MCPClient instances from config with task support enabled.
 
+    Environment variable references (${VAR_NAME}) in env, args, command,
+    url, and headers values are automatically resolved from the process
+    environment. This allows sharing config files without exposing tokens:
+
+        {
+          "env": {
+            "GITHUB_TOKEN": "${MY_GITHUB_TOKEN}",
+            "API_KEY": "${MY_API_KEY}"
+          }
+        }
+
     Args:
         config: MCP config dict (with mcpServers key)
         logging_callback: Callback for MCP log messages (notifications/message)
@@ -106,9 +183,13 @@ def create_mcp_clients(
             # Build transport callable
             transport = None
             if "command" in cfg:
-                command = cfg["command"]
-                args = cfg.get("args", [])
-                env = cfg.get("env")
+                command = resolve_env_vars(cfg["command"])
+                args = [resolve_env_vars(a) if isinstance(a, str) else a for a in cfg.get("args", [])]
+
+                # Resolve env var references in the env dict
+                env = None
+                if cfg.get("env"):
+                    env = resolve_env_vars_in_dict(cfg["env"])
 
                 def make_transport(_cmd=command, _args=args, _env=env):
                     return stdio_client(StdioServerParameters(command=_cmd, args=_args, env=_env))
@@ -116,8 +197,12 @@ def create_mcp_clients(
                 transport = make_transport
 
             elif "url" in cfg:
-                url = cfg["url"]
-                headers = cfg.get("headers")
+                url = resolve_env_vars(cfg["url"])
+
+                # Resolve env var references in headers
+                headers = None
+                if cfg.get("headers"):
+                    headers = resolve_env_vars_in_dict(cfg["headers"])
 
                 def make_http_transport(_url=url, _headers=headers):
                     if "/sse" in _url:

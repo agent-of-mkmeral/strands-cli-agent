@@ -61,24 +61,45 @@ Uses the same format as Kiro/Claude Desktop. Place in any of:
 - `STRANDS_MCP_CONFIG` env var (path)
 - `MCP_SERVERS` env var (inline JSON)
 
-Example (`mcp.json`):
+### Environment Variable Pass-Through
+
+Use `${VAR_NAME}` syntax in config values to reference environment variables. This way you can share your config file without exposing tokens:
+
 ```json
 {
   "mcpServers": {
-    "agent-host": {
-      "command": "containerized-strands-agents",
-      "args": ["serve"]
+    "containerized-strands-agents": {
+      "command": "containerized-strands-agents-server",
+      "env": {
+        "CONTAINERIZED_AGENTS_GITHUB_TOKEN": "${STRANDS_CODER_TOKEN}",
+        "PERPLEXITY_API_KEY": "${PERPLEXITY_API_KEY}"
+      }
     },
     "github": {
       "command": "uvx",
       "args": ["mcp-server-github"],
       "env": {
-        "GITHUB_TOKEN": "ghp_..."
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+      }
+    },
+    "remote-api": {
+      "url": "https://${API_HOST}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${API_TOKEN}"
       }
     }
   }
 }
 ```
+
+Env var resolution works in:
+- `env` values — `"${MY_TOKEN}"` → actual token value
+- `args` — `["--token", "${MY_TOKEN}"]`
+- `command` — `"${BINARY_PATH}"`
+- `url` — `"https://${HOST}/mcp"`
+- `headers` — `"Bearer ${TOKEN}"`
+
+If an env var is not set, the `${VAR_NAME}` reference is left as-is and a warning is logged.
 
 ## Usage
 
@@ -112,14 +133,14 @@ strands-cli --no-tasks                        # Disable task tracking
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
+┌──────────────────────────────────────────────┐
 │                CLI (cli.py)                  │
 │  ┌─────────┐  ┌──────────┐  ┌───────────┐  │
 │  │  Agent   │  │ Callback │  │  Welcome   │  │
 │  │ (Strands)│  │ Handler  │  │  /Tasks UI │  │
 │  └────┬─────┘  └──────────┘  └───────────┘  │
 │       │                                      │
-│  ┌────▼────────────────────────────────────┐ │
+│  ┌────┼────────────────────────────────────┐ │
 │  │         MCP Clients (mcp_loader.py)     │ │
 │  │  ┌──────────┐  ┌──────────┐             │ │
 │  │  │ Server A │  │ Server B │  ...        │ │
@@ -127,7 +148,7 @@ strands-cli --no-tasks                        # Disable task tracking
 │  │  └────┬─────┘  └────┬─────┘             │ │
 │  └───────┼──────────────┼──────────────────┘ │
 │          │              │                    │
-│  ┌───────▼──────────────▼──────────────────┐ │
+│  ┌───────┼──────────────┼──────────────────┐ │
 │  │       TaskManager (task_manager.py)     │ │
 │  │                                         │ │
 │  │  • Tracks tasks from all servers        │ │
@@ -165,8 +186,11 @@ This CLI is designed to work with [containerized-strands-agents](https://github.
 {
   "mcpServers": {
     "agents": {
-      "command": "containerized-strands-agents",
-      "args": ["serve"]
+      "command": "containerized-strands-agents-server",
+      "env": {
+        "CONTAINERIZED_AGENTS_GITHUB_TOKEN": "${STRANDS_CODER_TOKEN}",
+        "PERPLEXITY_API_KEY": "${PERPLEXITY_API_KEY}"
+      }
     }
   }
 }
