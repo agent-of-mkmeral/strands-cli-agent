@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "agent-host": {
+      "command": "containerized-strands-agents",
+      "args": ["serve"],
+      "prefix": "agents"
+    },
+    "github": {
+      "command": "uvx",
+      "args": ["mcp-server-github"],
+      "env": {
+        "GITHUB_TOKEN": "your-token-here"
+      },
+      "disabled": true
+    },
+    "filesystem": {
+      "command": "uvx",
+      "args": ["mcp-server-filesystem", "/home/user/projects"],
+      "disabled": true
+    }
+  }
+}

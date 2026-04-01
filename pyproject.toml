@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "strands-cli-agent"
+version = "0.1.0"
+description = "A CLI agent with MCP Tasks and Notifications support. Demonstrates push-based task completion — when MCP servers complete background tasks, the agent is automatically re-triggered with results."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "mkmeral"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "strands-agents>=1.30.0",
+    "strands-agents-tools>=0.1.0",
+    "mcp>=1.26.0",
+    "rich>=14.0.0",
+    "prompt_toolkit>=3.0.51",
+    "halo>=0.0.31",
+]
+
+[project.scripts]
+strands-cli = "strands_cli_agent.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.26.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.4.4",
+    "mypy>=1.0.0",
+]
+
+[tool.hatch.build]
+packages = ["src/strands_cli_agent", "tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 120
+include = ["src/**/*.py", "tests/**/*.py", "tools/**/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
