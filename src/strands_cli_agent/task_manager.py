@@ -36,10 +36,11 @@ class TrackedTask:
     """A task being tracked by the manager."""
 
     task_id: str
-    server_name: str
-    tool_name: str
-    arguments: dict[str, Any] | None
-    status: str  # working, completed, failed, cancelled
+    server_name: str  # MCP server prefix (e.g., "containerized-strands-agents")
+    tool_name: str  # The tool that was called (e.g., "send_message")
+    agent_id: str | None = None  # Agent within the server (e.g., "researcher")
+    arguments: dict[str, Any] | None = None
+    status: str = "working"  # working, completed, failed, cancelled
     status_message: str | None = None
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     completed_at: str | None = None
@@ -53,8 +54,9 @@ class TaskManager:
     """Manages MCP task lifecycle with push-based completion handling.
 
     When a tool call returns an MCP Task, the TaskManager tracks it and
-    polls for completion. When the task finishes, it calls the completion
-    callback to re-trigger the agent.
+    polls for completion via the MCP tasks/get protocol endpoint (using
+    the MCPClient's internal session). When the task finishes, it calls
+    the completion callback to re-trigger the agent.
 
     The key design decision: task completion feeds back into the agent
     automatically. The user doesn't need to ask "is it done?" — the agent
@@ -82,8 +84,12 @@ class TaskManager:
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
-        # MCP session references for polling (server_name -> session getter)
-        self._session_getters: dict[str, Callable] = {}
+        # MCPClient references for protocol-level task polling
+        # Maps server_name (prefix) → MCPClient instance
+        self._mcp_clients: dict[str, Any] = {}
+
+        # Current user message for context
+        self._current_user_message: str | None = None
 
         # Load existing tasks
         self._load()
@@ -109,6 +115,7 @@ class TaskManager:
                     "task_id": task.task_id,
                     "server_name": task.server_name,
                     "tool_name": task.tool_name,
+                    "agent_id": task.agent_id,
                     "arguments": task.arguments,
                     "status": task.status,
                     "status_message": task.status_message,
@@ -122,22 +129,26 @@ class TaskManager:
         except Exception as e:
             logger.warning(f"Failed to save tasks: {e}")
 
-    def register_session_getter(self, server_name: str, getter: Callable) -> None:
-        """Register a function that returns the MCP ClientSession for a server.
+    def register_mcp_client(self, server_name: str, mcp_client: Any) -> None:
+        """Register an MCPClient for MCP protocol-level task polling.
 
-        This is needed so the TaskManager can poll tasks on the correct server.
+        The MCPClient's internal session is used to call tasks/get on the
+        server to check task status. This is more reliable than custom
+        polling because it uses the standard MCP Tasks protocol.
 
         Args:
-            server_name: The MCP server name (e.g., "agent-host")
-            getter: A callable that returns the ClientSession for that server
+            server_name: The MCP server prefix (e.g., "containerized-strands-agents")
+            mcp_client: The Strands MCPClient instance
         """
-        self._session_getters[server_name] = getter
+        self._mcp_clients[server_name] = mcp_client
+        logger.info(f"Registered MCPClient for task polling: {server_name}")
 
     def track_task(
         self,
         task_id: str,
         server_name: str,
         tool_name: str,
+        agent_id: str | None = None,
         arguments: dict[str, Any] | None = None,
         poll_interval_ms: int = 5000,
         original_user_message: str | None = None,
@@ -146,8 +157,9 @@ class TaskManager:
 
         Args:
             task_id: The MCP task ID returned by the server
-            server_name: Which MCP server created this task
+            server_name: Which MCP server prefix created this task
             tool_name: The tool that was called
+            agent_id: The agent within the server (e.g., "researcher")
             arguments: Tool arguments (for context)
             poll_interval_ms: How often to poll (from server hint)
             original_user_message: The user's original message (for re-triggering context)
@@ -156,18 +168,24 @@ class TaskManager:
             The TrackedTask object
         """
         with self._lock:
+            # Don't re-track existing tasks
+            if task_id in self._tasks:
+                logger.debug(f"Task {task_id} already tracked, skipping")
+                return self._tasks[task_id]
+
             task = TrackedTask(
                 task_id=task_id,
                 server_name=server_name,
                 tool_name=tool_name,
+                agent_id=agent_id,
                 arguments=arguments,
                 status="working",
                 poll_interval_ms=poll_interval_ms,
-                original_user_message=original_user_message,
+                original_user_message=original_user_message or self._current_user_message,
             )
             self._tasks[task_id] = task
             self._save()
-            logger.info(f"Tracking task {task_id} from {server_name}/{tool_name}")
+            logger.info(f"Tracking task {task_id} from {server_name}/{tool_name} (agent: {agent_id})")
 
             # Ensure polling is running
             self._ensure_polling()
@@ -224,29 +242,42 @@ class TaskManager:
 
             # Sleep for the minimum poll interval among active tasks
             min_interval = min(t.poll_interval_ms for t in active_tasks) / 1000.0
-            min_interval = max(min_interval, 1.0)  # At least 1 second
+            min_interval = max(min_interval, 2.0)  # At least 2 seconds
             await asyncio.sleep(min_interval)
 
     async def _poll_task(self, task: TrackedTask) -> None:
-        """Poll a single task's status via its MCP server."""
-        session_getter = self._session_getters.get(task.server_name)
-        if not session_getter:
-            logger.debug(f"No session getter for server {task.server_name}, skipping poll for {task.task_id}")
+        """Poll a single task's status via MCP protocol tasks/get.
+
+        Uses the MCPClient's internal session to call the standard MCP
+        tasks/get endpoint. Falls back gracefully if the session isn't
+        available.
+        """
+        mcp_client = self._mcp_clients.get(task.server_name)
+        if not mcp_client:
+            logger.debug(f"No MCPClient for server '{task.server_name}', cannot poll task {task.task_id}")
             return
 
         try:
-            session = session_getter()
-            if not session:
+            # Access MCPClient's internal session and event loop
+            session = getattr(mcp_client, '_background_thread_session', None)
+            event_loop = getattr(mcp_client, '_background_thread_event_loop', None)
+
+            if not session or not event_loop:
+                logger.debug(f"MCPClient session not available for {task.server_name}")
                 return
 
-            # Use the experimental tasks API
-            result = await session.experimental.get_task(task.task_id)
+            # Submit tasks/get request to MCPClient's event loop
+            future = asyncio.run_coroutine_threadsafe(
+                session.experimental.get_task(task.task_id),
+                event_loop,
+            )
+            result = future.result(timeout=15)
 
             old_status = task.status
             task.status = result.status
-            task.status_message = result.statusMessage
+            task.status_message = getattr(result, 'statusMessage', None)
 
-            if result.pollInterval:
+            if hasattr(result, 'pollInterval') and result.pollInterval:
                 task.poll_interval_ms = result.pollInterval
 
             if old_status != task.status:
@@ -258,15 +289,24 @@ class TaskManager:
             if task.status in ("completed", "failed", "cancelled"):
                 task.completed_at = datetime.now(timezone.utc).isoformat()
 
-                # Get the task result/payload
+                # Get the task result/payload for completed tasks
                 if task.status == "completed":
                     try:
                         from mcp.types import GetTaskPayloadResult
 
-                        payload = await session.experimental.get_task_result(task.task_id, GetTaskPayloadResult)
-                        # Extract content
+                        payload_future = asyncio.run_coroutine_threadsafe(
+                            session.experimental.get_task_result(task.task_id, GetTaskPayloadResult),
+                            event_loop,
+                        )
+                        payload = payload_future.result(timeout=15)
+
                         if hasattr(payload, "content") and payload.content:
-                            task.result = {"content": [c.model_dump() if hasattr(c, "model_dump") else c for c in payload.content]}
+                            task.result = {
+                                "content": [
+                                    c.model_dump() if hasattr(c, "model_dump") else c
+                                    for c in payload.content
+                                ]
+                            }
                         elif hasattr(payload, "model_dump"):
                             task.result = payload.model_dump()
                     except Exception as e:
@@ -338,30 +378,40 @@ class TaskManager:
                         logger.error(f"Failure callback error for {task_id}: {e}")
 
     def _fetch_result_and_callback(self, task: TrackedTask) -> None:
-        """Fetch task result and fire completion callback (runs in thread)."""
-        loop = asyncio.new_event_loop()
+        """Fetch task result via MCPClient and fire completion callback."""
+        mcp_client = self._mcp_clients.get(task.server_name)
+        if not mcp_client:
+            # No client, just fire callback without result
+            if self._on_completed:
+                try:
+                    self._on_completed(task)
+                except Exception as e:
+                    logger.error(f"Completion callback error for {task.task_id}: {e}")
+            return
+
         try:
-            loop.run_until_complete(self._async_fetch_and_callback(task))
-        finally:
-            loop.close()
+            session = getattr(mcp_client, '_background_thread_session', None)
+            event_loop = getattr(mcp_client, '_background_thread_event_loop', None)
 
-    async def _async_fetch_and_callback(self, task: TrackedTask) -> None:
-        """Async: fetch task result from server and fire completion callback."""
-        session_getter = self._session_getters.get(task.server_name)
-        if session_getter:
-            try:
-                session = session_getter()
-                if session:
-                    from mcp.types import GetTaskPayloadResult
+            if session and event_loop:
+                from mcp.types import GetTaskPayloadResult
 
-                    payload = await session.experimental.get_task_result(task.task_id, GetTaskPayloadResult)
-                    if hasattr(payload, "content") and payload.content:
-                        task.result = {"content": [c.model_dump() if hasattr(c, "model_dump") else c for c in payload.content]}
-                    elif hasattr(payload, "model_dump"):
-                        task.result = payload.model_dump()
-            except Exception as e:
-                logger.warning(f"Failed to fetch result for completed task {task.task_id}: {e}")
-                task.result = {"error": str(e)}
+                future = asyncio.run_coroutine_threadsafe(
+                    session.experimental.get_task_result(task.task_id, GetTaskPayloadResult),
+                    event_loop,
+                )
+                payload = future.result(timeout=15)
+
+                if hasattr(payload, "content") and payload.content:
+                    task.result = {
+                        "content": [
+                            c.model_dump() if hasattr(c, "model_dump") else c
+                            for c in payload.content
+                        ]
+                    }
+        except Exception as e:
+            logger.warning(f"Failed to fetch result for task {task.task_id}: {e}")
+            task.result = {"error": str(e)}
 
         with self._lock:
             self._save()

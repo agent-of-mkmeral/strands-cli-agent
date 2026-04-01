@@ -7,11 +7,12 @@ without having to ask "is it done?".
 Flow:
 1. User types a message
 2. Agent processes it, may call MCP tools that return Tasks
-3. Agent responds (may say "dispatched, I'll let you know when done")
-4. User can continue chatting or wait
-5. Background: TaskManager polls/receives notifications for task completion
-6. When task completes → agent is re-invoked with the result
-7. Agent processes the result and displays it to the user
+3. CallbackHandler detects taskId in tool results → TaskManager.track_task()
+4. Agent responds (may say "dispatched, I'll let you know when done")
+5. User can continue chatting or wait
+6. Background: TaskManager polls tasks/get via MCPClient's session
+7. When task completes → completion callback → agent is re-invoked with the result
+8. Agent processes the result and displays it to the user
 """
 
 import argparse
@@ -42,14 +43,14 @@ _completion_queue: queue.Queue[TrackedTask] = queue.Queue()
 def _on_task_completed(task: TrackedTask) -> None:
     """Called by TaskManager when a task completes. Queues it for agent re-trigger."""
     _completion_queue.put(task)
-    callback_handler_instance.on_task_completed(task.task_id, task.server_name)
+    callback_handler_instance.on_task_completed(task.task_id, task.agent_id or task.server_name)
 
 
 def _on_task_failed(task: TrackedTask) -> None:
     """Called by TaskManager when a task fails."""
     _completion_queue.put(task)
     callback_handler_instance.on_task_failed(
-        task.task_id, task.server_name, task.status_message
+        task.task_id, task.agent_id or task.server_name, task.status_message
     )
 
 
@@ -60,8 +61,9 @@ def _on_task_status_changed(task: TrackedTask) -> None:
 
 def _format_task_result(task: TrackedTask) -> str:
     """Format a completed task result as a message to feed back into the agent."""
+    agent_label = task.agent_id or task.server_name
     parts = [
-        f"[Task Completed] The background task '{task.task_id}' from server '{task.server_name}' "
+        f"[Task Completed] The background task '{task.task_id}' from '{agent_label}' "
         f"(tool: {task.tool_name}) has {task.status}."
     ]
 
@@ -165,10 +167,11 @@ def _show_tasks(task_manager: TaskManager) -> None:
     for task in sorted(tasks, key=lambda t: t.created_at, reverse=True):
         style = status_style.get(task.status, "white")
         emoji = {"working": "⏳", "completed": "✅", "failed": "❌", "cancelled": "🚫"}.get(task.status, "📋")
+        agent_label = task.agent_id or task.server_name
         console.print(
             f"  {emoji} [{style}]{task.status:10s}[/{style}] "
-            f"[cyan]{task.task_id[:12]}...[/cyan] "
-            f"[dim]{task.server_name}/{task.tool_name}[/dim]"
+            f"[cyan]{task.task_id[:16]}...[/cyan] "
+            f"[dim]{agent_label}/{task.tool_name}[/dim]"
         )
         if task.status_message:
             console.print(f"     [dim]{task.status_message[:80]}[/dim]")
@@ -218,6 +221,23 @@ def main() -> None:
     mcp_config = load_mcp_config(args.mcp_config)
     mcp_clients = create_mcp_clients(mcp_config)
 
+    # Build prefix → MCPClient mapping for task polling
+    mcp_client_map: dict[str, object] = {}
+    for client in mcp_clients:
+        prefix = getattr(client, '_prefix', None) or "unknown"
+        mcp_client_map[prefix] = client
+
+    # Wire up TaskManager with MCPClients for protocol-level polling
+    if task_manager and mcp_client_map:
+        for prefix, client in mcp_client_map.items():
+            task_manager.register_mcp_client(prefix, client)
+
+        # Wire callback handler to detect tasks in tool results
+        callback_handler_instance.set_task_manager(
+            task_manager,
+            mcp_prefixes=set(mcp_client_map.keys()),
+        )
+
     # Build tools list
     tools: list = []
 
@@ -239,7 +259,6 @@ def main() -> None:
     # Create model
     from strands_tools.utils.models.model import create_model
 
-    model_kwargs = {}
     if args.model_id:
         os.environ["STRANDS_MODEL_ID"] = args.model_id
 
@@ -267,6 +286,12 @@ def main() -> None:
     # Non-interactive mode
     if args.query:
         query = " ".join(args.query)
+
+        # Set context for task detection
+        if task_manager:
+            task_manager._current_user_message = query
+            callback_handler_instance.set_current_user_message(query)
+
         agent(query)
 
         # If tasks were created, wait for them
@@ -339,6 +364,7 @@ def main() -> None:
                 # Store the current user message for task context
                 if task_manager:
                     task_manager._current_user_message = user_input
+                    callback_handler_instance.set_current_user_message(user_input)
 
                 agent(user_input)
 
