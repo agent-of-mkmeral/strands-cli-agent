@@ -1,8 +1,8 @@
 """Main CLI entry point — interactive agent with MCP Tasks push-based completion.
 
 This is the core loop. When a task completes, the agent is re-triggered
-with the result automatically. The user gets notified through the CLI
-without having to ask "is it done?".
+with the result automatically — even if the user is idle at the prompt.
+The user gets notified through the CLI without having to ask "is it done?".
 
 Flow:
 1. User types a message
@@ -11,8 +11,14 @@ Flow:
 4. Agent responds (may say "dispatched, I'll let you know when done")
 5. User can continue chatting or wait
 6. Background: TaskManager polls tasks/get via MCPClient's session
-7. When task completes → completion callback → agent is re-invoked with the result
-8. Agent processes the result and displays it to the user
+7. When task completes → _completion_queue → _completion_watcher thread
+8. Watcher acquires _agent_lock, re-invokes agent with the result
+9. Agent processes the result and displays it to the user
+
+Key design: The completion watcher runs on a background thread and serializes
+agent calls via _agent_lock. If the agent is busy (user message or another
+completion), the watcher waits. If the agent is idle (user at prompt), the
+watcher processes immediately — no user action needed.
 """
 
 import argparse
@@ -22,6 +28,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from pathlib import Path
 
 from rich.console import Console
@@ -38,6 +45,22 @@ console = Console()
 
 # Queue for task completion events that need to re-trigger the agent
 _completion_queue: queue.Queue[TrackedTask] = queue.Queue()
+
+# Lock to serialize agent invocations (user messages + task completions)
+# Only one agent() call at a time — prevents interleaved output and state issues
+_agent_lock = threading.RLock()
+
+# Event that's SET when the agent is idle (not running), CLEARED when busy.
+# The completion watcher waits on this before calling agent().
+_agent_idle = threading.Event()
+_agent_idle.set()  # Start as idle
+
+# Global reference to the agent — set during main() initialization,
+# used by the completion watcher thread
+_agent_ref = None
+
+# Stop signal for the completion watcher thread
+_stop_watcher = threading.Event()
 
 
 def _on_task_completed(task: TrackedTask) -> None:
@@ -88,6 +111,78 @@ def _format_task_result(task: TrackedTask) -> str:
     return "\n".join(parts)
 
 
+def _invoke_agent_with_result(agent, task: TrackedTask) -> None:
+    """Re-invoke the agent with a completed task result.
+
+    This is called from the completion watcher thread. It acquires the
+    agent lock, formats the task result, and calls agent() so the agent
+    can process and present the result to the user.
+
+    If the agent is currently busy (user message or another completion),
+    this blocks until the lock is available — completions are never dropped.
+    """
+    result_msg = _format_task_result(task)
+    agent_label = task.agent_id or task.server_name
+
+    # Wait for agent to be idle
+    _agent_idle.wait()
+
+    with _agent_lock:
+        _agent_idle.clear()
+        try:
+            console.print(
+                f"\n[bold cyan]🔔 Task result from '{agent_label}' — processing...[/bold cyan]"
+            )
+            agent(result_msg)
+        except Exception as e:
+            console.print(f"\n[red]Error processing task result: {e}[/red]")
+            logger.error(f"Agent re-invocation error for task {task.task_id}: {e}")
+        finally:
+            _agent_idle.set()
+
+
+def _completion_watcher_fn(agent) -> None:
+    """Background thread that watches for task completions and re-invokes the agent.
+
+    This is the key piece that makes push-based completion work:
+    - TaskManager detects a completed task → puts it in _completion_queue
+    - This thread takes from the queue (blocking wait)
+    - Waits for the agent to be idle (not processing a user message)
+    - Acquires _agent_lock and calls agent() with the task result
+    - The user sees the result appear automatically in the CLI
+
+    If the agent is busy when a completion arrives, it queues up and
+    processes as soon as the agent is free. Multiple completions are
+    processed sequentially (FIFO).
+    """
+    logger.info("Completion watcher thread started")
+
+    while not _stop_watcher.is_set():
+        try:
+            # Block until a task completion arrives (with timeout for clean shutdown)
+            task = _completion_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        # Process the completion
+        try:
+            _invoke_agent_with_result(agent, task)
+        except Exception as e:
+            logger.error(f"Completion watcher error: {e}")
+
+        # Drain any additional completions that arrived while we were processing
+        while not _completion_queue.empty():
+            try:
+                task = _completion_queue.get_nowait()
+                _invoke_agent_with_result(agent, task)
+            except queue.Empty:
+                break
+            except Exception as e:
+                logger.error(f"Completion watcher drain error: {e}")
+
+    logger.info("Completion watcher thread stopped")
+
+
 def _load_system_prompt() -> str:
     """Load system prompt with task-awareness instructions."""
     # Check env var first
@@ -127,7 +222,7 @@ def _show_welcome() -> None:
 
     welcome = Text()
     welcome.append("Connected to MCP servers with task support.\n", style="dim")
-    welcome.append("• Background tasks complete automatically\n", style="dim")
+    welcome.append("• Background tasks auto-trigger when complete\n", style="dim")
     welcome.append("• Type ", style="dim")
     welcome.append("/tasks", style="bold cyan")
     welcome.append(" to see active tasks\n", style="dim")
@@ -294,18 +389,27 @@ def main() -> None:
 
         agent(query)
 
-        # If tasks were created, wait for them
+        # If tasks were created, wait for them with proper re-invocation
         if task_manager and task_manager.get_active_tasks():
             console.print("\n[dim]Waiting for background tasks to complete...[/dim]")
-            import time
 
             while task_manager.get_active_tasks():
                 # Process any completed tasks
-                while not _completion_queue.empty():
-                    completed = _completion_queue.get_nowait()
+                try:
+                    completed = _completion_queue.get(timeout=1.0)
                     result_msg = _format_task_result(completed)
+                    console.print(
+                        f"\n[bold cyan]🔔 Task result — processing...[/bold cyan]"
+                    )
                     agent(result_msg)
-                time.sleep(1)
+                except queue.Empty:
+                    continue
+
+            # Drain any remaining completions
+            while not _completion_queue.empty():
+                completed = _completion_queue.get_nowait()
+                result_msg = _format_task_result(completed)
+                agent(result_msg)
 
         if task_manager:
             task_manager.stop()
@@ -314,17 +418,22 @@ def main() -> None:
     # Interactive mode
     _show_welcome()
 
+    # Start the completion watcher thread — this is what makes push-based
+    # re-invocation work. When a task completes, this thread picks it up
+    # and calls agent() automatically, even if the user is idle at the prompt.
+    _stop_watcher.clear()
+    watcher_thread = threading.Thread(
+        target=_completion_watcher_fn,
+        args=(agent,),
+        daemon=True,
+        name="completion-watcher",
+    )
+    watcher_thread.start()
+
     from strands_tools.utils.user_input import get_user_input
 
     while True:
         try:
-            # Check for completed tasks before prompting
-            while not _completion_queue.empty():
-                completed = _completion_queue.get_nowait()
-                result_msg = _format_task_result(completed)
-                console.print(f"\n[bold cyan]🔔 Processing completed task result...[/bold cyan]")
-                agent(result_msg)
-
             user_input = get_user_input("\n~ ", default="", keyboard_interrupt_return_default=False)
 
             if user_input.lower() in ("exit", "quit"):
@@ -366,16 +475,27 @@ def main() -> None:
                     task_manager._current_user_message = user_input
                     callback_handler_instance.set_current_user_message(user_input)
 
-                agent(user_input)
+                # Acquire the lock — serializes with completion watcher.
+                # If the watcher is currently processing a completion,
+                # we wait here until it finishes. This prevents concurrent
+                # agent() calls.
+                with _agent_lock:
+                    _agent_idle.clear()
+                    try:
+                        agent(user_input)
+                    finally:
+                        _agent_idle.set()
 
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]Goodbye![/dim]")
             break
         except Exception as e:
+            _agent_idle.set()  # Ensure we're marked idle on error
             callback_handler(force_stop=True)
             console.print(f"\n[red]Error: {e}[/red]")
 
     # Cleanup
+    _stop_watcher.set()
     if task_manager:
         task_manager.stop()
 
